@@ -9,3 +9,4 @@ numpy
 faiss-cpu
 PyMuPDF
 rank-bm25
+sentence-transformers
