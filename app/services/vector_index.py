@@ -1,23 +1,29 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List
 
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.preprocessing import normalize
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import DocumentChunk
-from app.services.cache_service import CacheService
-from app.utils.hashing import embedding_cache_key
 
 
-# Embedding model
-MODEL_NAME = "all-MiniLM-L6-v2"
-_model = SentenceTransformer(MODEL_NAME)
+MODEL_NAME = "hashing-vectorizer"
+VECTOR_DIM = 384
 
-# In-memory FAISS cache for global search only
+_vectorizer = HashingVectorizer(
+    n_features=VECTOR_DIM,
+    alternate_sign=False,
+    norm=None,
+    lowercase=True,
+    ngram_range=(1, 2),
+)
+
 _cached_index = None
 _cached_chunks = None
 
@@ -31,11 +37,20 @@ class VectorHit:
     preview: str
 
 
+def _encode_texts(texts: list[str]) -> np.ndarray:
+    """
+    Lightweight embedding replacement for Render free tier.
+    Converts text into normalized hashing vectors.
+    """
+    if not texts:
+        return np.zeros((0, VECTOR_DIM), dtype="float32")
+
+    matrix = _vectorizer.transform(texts)
+    matrix = normalize(matrix, norm="l2", axis=1)
+    return matrix.astype("float32").toarray()
+
+
 def clear_vector_cache():
-    """
-    Clears in-memory FAISS cache.
-    Call this after uploading new PDFs / new chunks.
-    """
     global _cached_index, _cached_chunks
     _cached_index = None
     _cached_chunks = None
@@ -45,16 +60,12 @@ async def build_faiss_index(
     db: AsyncSession,
     doc_ids: list[str] | None = None,
 ):
-    """
-    Builds FAISS index from chunks.
-    Uses embedding cache table so vectors are not recomputed.
-    If doc_ids is provided, only those documents are indexed.
-    """
     stmt = select(DocumentChunk)
 
     if doc_ids is not None:
         if not doc_ids:
             return None, []
+
         stmt = stmt.where(DocumentChunk.doc_id.in_(doc_ids))
 
     res = await db.execute(stmt)
@@ -64,48 +75,13 @@ async def build_faiss_index(
         return None, []
 
     texts = [c.chunk_text or "" for c in chunks]
+    emb = _encode_texts(texts)
 
-    results = [None] * len(texts)
-    missing_texts = []
-    missing_indices = []
-    missing_keys = []
-
-    # Check embedding cache first
-    for i, text in enumerate(texts):
-        key = embedding_cache_key(MODEL_NAME, text)
-        cached_vector = await CacheService.get_embedding(db, key)
-
-        if cached_vector is not None:
-            results[i] = cached_vector
-        else:
-            missing_texts.append(text)
-            missing_indices.append(i)
-            missing_keys.append(key)
-
-    # Compute only missing embeddings
-    if missing_texts:
-        new_vectors = _model.encode(missing_texts, normalize_embeddings=True)
-        new_vectors = np.asarray(new_vectors, dtype="float32")
-
-        for idx, key, text, vector in zip(
-            missing_indices, missing_keys, missing_texts, new_vectors
-        ):
-            vector_list = vector.tolist()
-
-            await CacheService.set_embedding(
-                db=db,
-                cache_key=key,
-                model_name=MODEL_NAME,
-                text=text,
-                vector=vector_list,
-            )
-
-            results[idx] = vector_list
-
-    emb = np.asarray(results, dtype="float32")
+    if emb.shape[0] == 0:
+        return None, []
 
     d = emb.shape[1]
-    index = faiss.IndexFlatIP(d)  # cosine similarity because normalized
+    index = faiss.IndexFlatIP(d)
     index.add(emb)
 
     return index, chunks
@@ -117,12 +93,6 @@ async def vector_search(
     k: int = 10,
     doc_ids: list[str] | None = None,
 ) -> List[VectorHit]:
-    """
-    Vector search with optional workspace/doc filtering.
-
-    - If doc_ids is None: reuse global in-memory FAISS cache
-    - If doc_ids is provided: build a filtered index for only those docs
-    """
     global _cached_index, _cached_chunks
 
     if doc_ids is not None:
@@ -136,8 +106,7 @@ async def vector_search(
     if index is None:
         return []
 
-    q_emb = _model.encode([query], normalize_embeddings=True)
-    q_emb = np.asarray(q_emb, dtype="float32")
+    q_emb = _encode_texts([query])
 
     scores, ids = index.search(q_emb, k)
     scores = scores[0]
