@@ -5,6 +5,8 @@ interface Props {
   workspaceId: string | null;
 }
 
+const API_BASE = "https://pdf-chat-backend-jccs.onrender.com";
+
 export default function ChatPanel({ workspaceId }: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [question, setQuestion] = useState("");
@@ -26,10 +28,14 @@ export default function ChatPanel({ workspaceId }: Props) {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/chat_stream?workspace_id=${workspaceId}&q=${encodeURIComponent(currentQuestion)}`
+        `${API_BASE}/chat_stream?workspace_id=${workspaceId}&q=${encodeURIComponent(
+          currentQuestion
+        )}`
       );
 
-      if (!response.body) throw new Error("No response stream");
+      if (!response.body) {
+        throw new Error("No response stream");
+      }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -39,6 +45,7 @@ export default function ChatPanel({ workspaceId }: Props) {
 
       while (true) {
         const { value, done } = await reader.read();
+
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -75,21 +82,36 @@ export default function ChatPanel({ workspaceId }: Props) {
                 return updated;
               });
             }
-          } catch (err) {
+
+            if (event.type === "error") {
+              setMessages((prev) => {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  ...updated[updated.length - 1],
+                  content: event.message || "Something went wrong.",
+                };
+                return updated;
+              });
+            }
+          } catch {
             console.error("Invalid JSON line:", line);
           }
         }
       }
 
       const fullRes = await fetch(
-        `http://127.0.0.1:8000/ask?q=${encodeURIComponent(currentQuestion)}&workspace_id=${workspaceId}`
+        `${API_BASE}/ask?q=${encodeURIComponent(
+          currentQuestion
+        )}&workspace_id=${workspaceId}`
       );
+
       const fullData = await fullRes.json();
 
       setMessages((prev) => {
         const updated = [...prev];
         updated[updated.length - 1] = {
           ...updated[updated.length - 1],
+          content: updated[updated.length - 1].content || fullData.answer || "",
           citations: fullData.citations || [],
           evidence_quotes: fullData.evidence_quotes || [],
         };
@@ -97,6 +119,15 @@ export default function ChatPanel({ workspaceId }: Props) {
       });
     } catch (error) {
       console.error(error);
+
+      setMessages((prev) => {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          content: "Sorry, I could not connect to the backend.",
+        };
+        return updated;
+      });
     } finally {
       setLoading(false);
     }
@@ -131,7 +162,8 @@ export default function ChatPanel({ workspaceId }: Props) {
                 <ul className="quotes-list">
                   {msg.evidence_quotes.map((q, i) => (
                     <li key={i}>
-                      “{q.quote}” <span className="quote-page">(p.{q.page_num})</span>
+                      “{q.quote}”{" "}
+                      <span className="quote-page">(p.{q.page_num})</span>
                     </li>
                   ))}
                 </ul>
